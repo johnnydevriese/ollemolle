@@ -1,0 +1,29 @@
+[project]
+name = "ollemolle"
+version = "0.1.0"
+description = "Local Ghostty session save and restore utility"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2,<3",
+]
+
+[project.scripts]
+ollemolle = "ollemolle.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ollemolle"]
+
+[tool.basedpyright]
+typeCheckingMode = "strict"
+include = ["src"]
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.40.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.7",
+]
