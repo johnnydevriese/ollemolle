@@ -1,4 +1,4 @@
-# ollemolle
+# 🦦🔄 ollemolle
 
 Restore live Oh My Pi and Claude Code sessions into a single Ghostty window.
 
