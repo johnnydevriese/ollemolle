@@ -63,6 +63,8 @@ The command accepts `SessionStart`, `UserPromptSubmit`, and `SessionEnd` hook ev
 
 ## Storage and safety
 
+- OMP discovery considers only `omp` processes beneath Ghostty that own a controlling terminal. Detached OMP processes, such as worker daemons or a background `omp update`, are helpers and are ignored. A terminal-backed OMP process whose tty, registry record, or session header cannot be verified blocks `save` and restore preflight instead of being guessed or skipped.
+- OMP rewrites its terminal registry record only when the content changes, so a transcript resumed on a reused tty keeps an older record. Such a record is accepted only when the live process holds OMP's ownership lease (`.<transcript>.owner.lock`) for that transcript, or was launched exactly as ollemolle restores it (`omp [--profile <name>] --resume <transcript>`, no other arguments, no whitespace in any argument). Otherwise it is treated as stale.
 - Snapshots default to `~/.local/state/ollemolle/` and are written with mode `0600` inside a mode `0700` directory.
 - Set `OLLEMOLLE_STATE_DIR` to move snapshot storage.
 - Restore preflight refuses stale sessions, duplicate session identities, unsafe resume arguments, missing working directories, and sessions that are already live.

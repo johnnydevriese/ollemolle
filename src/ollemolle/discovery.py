@@ -31,6 +31,7 @@ _STATE_ENV = "OLLEMOLLE_STATE_DIR"
 _DEFAULT_OMP_REGISTRY = Path.home() / ".omp" / "agent" / "terminal-sessions"
 _CLAUDE_REGISTRY_NAME = "claude-live.json"
 _CLAUDE_LOCK_NAME = "claude-live.lock"
+_NO_CONTROLLING_TTY = frozenset({"?", "??"})
 
 
 class DiscoveryCommandError(RuntimeError):
@@ -44,6 +45,7 @@ class _FrozenDiscoveryModel(BaseModel):
 class ProcessInfo(_FrozenDiscoveryModel):
     pid: int = Field(gt=0)
     ppid: int = Field(ge=0)
+    controlling_tty: str | None
     comm: str = Field(min_length=1)
     command: str = Field(min_length=1)
 
@@ -356,14 +358,6 @@ def _session_from_omp_record(
             )
         )
         return None
-    if not _registry_record_matches_start(record_path, process_started, issues):
-        issues.append(
-            Issue(
-                label="omp registry",
-                detail=f"registry record {record_path} predates live pid {process.pid}; likely stale",
-            )
-        )
-        return None
     lines = _read_registry_lines(record_path, issues)
     if lines is None:
         return None
@@ -377,6 +371,18 @@ def _session_from_omp_record(
         return None
     cwd = Path(lines[0]).expanduser()
     session_file = Path(lines[1]).expanduser()
+    if not (
+        _registry_record_matches_start(record_path, process_started, issues)
+        or _launched_as_omp_resume(process, runtime_config, session_file)
+        or _holds_omp_session_lease(process.pid, session_file, issues)
+    ):
+        issues.append(
+            Issue(
+                label="omp registry",
+                detail=f"registry record {record_path} predates live pid {process.pid}, which was not launched to resume that transcript and does not hold its OMP ownership lease; likely stale",
+            )
+        )
+        return None
     if not cwd.is_absolute() or not cwd.is_dir():
         issues.append(
             Issue(
@@ -518,21 +524,24 @@ def _report_unregistered_claude(
 
 def _process_table(issues: list[Issue]) -> dict[int, ProcessInfo]:
     try:
-        output = _run(["ps", "-axo", "pid=,ppid=,comm=,command="])
+        output = _run(["ps", "-axo", "pid=,ppid=,tty=,comm=,command="])
     except DiscoveryCommandError as exc:
         issues.append(Issue(label="process table", detail=str(exc)))
         return {}
     processes: dict[int, ProcessInfo] = {}
     for line in output.splitlines():
-        parts = line.strip().split(None, 3)
-        if len(parts) < 3:
+        parts = line.strip().split(None, 4)
+        if len(parts) < 4:
             continue
         try:
             data = {
                 "pid": int(parts[0]),
                 "ppid": int(parts[1]),
-                "comm": parts[2],
-                "command": parts[3] if len(parts) == 4 else parts[2],
+                "controlling_tty": None
+                if parts[2] in _NO_CONTROLLING_TTY
+                else parts[2],
+                "comm": parts[3],
+                "command": parts[4] if len(parts) == 5 else parts[3],
             }
             process = ProcessInfo.model_validate(data)
         except (ValueError, ValidationError):
@@ -585,7 +594,11 @@ def _has_flag(process: ProcessInfo, flag: str) -> bool:
 
 
 def _is_interactive_omp(process: ProcessInfo) -> bool:
-    if not _name_matches(process, "omp"):
+    # An interactive OMP root always owns a controlling terminal. Detached OMP
+    # processes (worker daemons, background `omp update`) have none and are
+    # helpers, not sessions; terminal-backed roots still go through fd/registry
+    # verification and fail closed there.
+    if process.controlling_tty is None or not _name_matches(process, "omp"):
         return False
     tokens = _command_tokens(process.command)
     return not any(token.startswith("__omp_worker") for token in tokens[1:])
@@ -654,6 +667,49 @@ def _text_executable_for_basename(
         if path.name == executable_name:
             return path
     return None
+
+
+# OMP rewrites a terminal registry record only when its content changes, so a
+# transcript resumed on a reused tty keeps a record older than the new process.
+# These two checks bind such a record to the live pid without guessing.
+
+
+def _launched_as_omp_resume(
+    process: ProcessInfo, runtime_config: OmpRuntimeConfig, session_file: Path
+) -> bool:
+    # ps joins argv with single spaces and drops quoting, so accept only the exact
+    # restore launch shape: one omp argv0 token followed by precisely the resume
+    # arguments for this transcript. Extra flags or messages fail closed, and so
+    # does any token with whitespace or control characters, whose argv boundary
+    # ps cannot show.
+    tokens = process.command.split(" ")
+    expected = _omp_resume_args(runtime_config, session_file)
+    return (
+        all(_is_plain_argv_token(token) for token in (*tokens, *expected))
+        and Path(tokens[0]).name == "omp"
+        and tuple(tokens[1:]) == expected
+    )
+
+
+def _is_plain_argv_token(token: str) -> bool:
+    return (
+        bool(token)
+        and token.isprintable()
+        and not any(character.isspace() for character in token)
+    )
+
+
+def _holds_omp_session_lease(pid: int, session_file: Path, issues: list[Issue]) -> bool:
+    # OMP holds `.<transcript>.owner.lock` open while it owns the transcript. It
+    # claims the lease lazily on its first session write, so an idle resumed
+    # session may not hold it yet; holding it is sufficient, not required.
+    lease = session_file.parent.resolve() / f".{session_file.name}.owner.lock"
+    try:
+        output = _run(["lsof", "-p", str(pid), "-Fn"])
+    except DiscoveryCommandError as exc:
+        issues.append(Issue(label="omp lease", detail=f"pid {pid}: {exc}"))
+        return False
+    return f"n{lease}" in output.splitlines()
 
 
 def _tty_for_pid(pid: int, issues: list[Issue]) -> str | None:
