@@ -68,6 +68,7 @@ The command accepts `SessionStart`, `UserPromptSubmit`, and `SessionEnd` hook ev
 - Snapshots default to `~/.local/state/ollemolle/` and are written with mode `0600` inside a mode `0700` directory.
 - Set `OLLEMOLLE_STATE_DIR` to move snapshot storage.
 - Restore preflight refuses stale sessions, duplicate session identities, unsafe resume arguments, missing working directories, and sessions that are already live.
+- Homebrew upgrades remove the keg a running process was started from, so that process keeps reporting a versioned path such as `/opt/homebrew/Cellar/omp/<old>/bin/omp`. Save records the stable launcher `<prefix>/bin/<tool>` instead (`/opt/homebrew` on Apple Silicon, `/usr/local` on Intel), but only when the launcher is runnable and resolves to the same formula's `Cellar/<formula>/<version>/bin/<tool>`. Restore launches that same launcher when a saved versioned Homebrew path no longer exists; the snapshot file is never rewritten. Existing saved executables, including explicit custom or pinned ones, are never replaced. Any other missing executable, a launcher for a different formula or outside the formula's package tree, and a missing or non-runnable launcher still fail preflight.
 - Restores are serialized with a local lock and each tab starts its saved command through `zsh -lic`.
 
 ## Development

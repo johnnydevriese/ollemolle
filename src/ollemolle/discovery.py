@@ -936,15 +936,56 @@ def _preferred_executable(
     executable_name: Literal["omp", "claude"], actual_executable: Path
 ) -> Path:
     found = shutil.which(executable_name)
-    if found is None:
-        return actual_executable
-    candidate = Path(found).expanduser()
+    if found is not None:
+        candidate = Path(found).expanduser()
+        try:
+            if candidate.resolve() == actual_executable.resolve():
+                return candidate
+        except OSError:
+            return actual_executable
+    return _stable_homebrew_launcher(actual_executable) or actual_executable
+
+
+# Homebrew installs each version at <prefix>/Cellar/<formula>/<version>/bin/<tool>
+# and links <prefix>/bin/<tool> to the active one. A process started before an
+# upgrade keeps the removed keg path; the stable launcher replaces it only when the
+# launcher is runnable and resolves to <version>/bin/<tool> of the same formula.
+def _stable_homebrew_launcher(executable: Path) -> Path | None:
+    parts = executable.parts
+    if not executable.is_absolute() or len(parts) < 8:
+        return None
+    *prefix_parts, cellar, formula, _version, bin_dir, tool = parts
+    if cellar != "Cellar" or bin_dir != "bin":
+        return None
+    prefix = Path(*prefix_parts)
+    launcher = prefix / "bin" / tool
     try:
-        if candidate.resolve() == actual_executable.resolve():
-            return candidate
+        if not (launcher.is_file() and os.access(launcher, os.X_OK)):
+            return None
+        target = launcher.resolve(strict=True).relative_to(
+            (prefix / "Cellar" / formula).resolve()
+        )
+    except (OSError, ValueError):
+        return None
+    if len(target.parts) != 3 or target.parts[1:] != ("bin", tool):
+        return None
+    return launcher
+
+
+def restore_executable(saved: Path) -> Path:
+    """Return the executable a restore launches for one saved session.
+
+    An existing saved path is used unchanged, including explicit custom or pinned
+    executables. Only a missing Homebrew keg path is redirected to its launcher.
+    """
+    try:
+        saved.lstat()
+    except FileNotFoundError:
+        return _stable_homebrew_launcher(saved) or saved
     except OSError:
-        return actual_executable
-    return actual_executable
+        # Not a missing entry, such as a path under a regular file or a symlink loop.
+        return saved
+    return saved
 
 
 def _claude_executable(process: ProcessInfo, issues: list[Issue]) -> Path | None:

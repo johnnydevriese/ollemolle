@@ -122,6 +122,13 @@ def _active_conflict_errors(
     return tuple(errors)
 
 
+def _restorable_session(session: Session) -> Session:
+    executable = discovery.restore_executable(session.executable)
+    if executable == session.executable:
+        return session
+    return session.model_copy(update={"executable": executable})
+
+
 def preflight_restore(snapshot: Snapshot) -> tuple[LaunchRequest, ...]:
     errors: list[str] = []
     if not snapshot.sessions:
@@ -132,7 +139,8 @@ def preflight_restore(snapshot: Snapshot) -> tuple[LaunchRequest, ...]:
         errors.append(str(exc))
     errors.extend(_duplicate_snapshot_errors(snapshot.sessions))
     requests: list[LaunchRequest] = []
-    for session in snapshot.sessions:
+    for saved_session in snapshot.sessions:
+        session = _restorable_session(saved_session)
         errors.extend(_session_preflight_errors(session))
         try:
             requests.extend(launch_requests((session,)))

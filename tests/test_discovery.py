@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from ollemolle import discovery, main
-from ollemolle.models import Issue, Session
+from ollemolle.models import Discovery, Issue, Session, Snapshot
 from ollemolle.storage import read_snapshot
 
 _PROCESS_STARTED = "Thu Oct  1 08:00:00 2026"
@@ -25,10 +25,34 @@ _PROCESS_TABLE = f"""\
 """
 
 
+_CLAUDE_SESSION_ID = "11111111-1111-4111-8111-111111111111"
+_CLAUDE_FORMULA = "claude-code"
+
+
+def _keg(prefix: Path, formula: str, tool: str, version: str) -> Path:
+    return prefix / "Cellar" / formula / version / "bin" / tool
+
+
+def _write_executable(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def _install_homebrew(prefix: Path, *, formula: str, tool: str) -> Path:
+    """Install an 18.8.6 keg and link <prefix>/bin/<tool> to it, as brew does."""
+    _write_executable(_keg(prefix, formula, tool, "18.8.6"))
+    launcher = prefix / "bin" / tool
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    launcher.symlink_to(Path("..", "Cellar", formula, "18.8.6", "bin", tool))
+    return launcher
+
+
 class _FakeSystem:
     """Answers the bounded ps/lsof calls discovery makes for _PROCESS_TABLE."""
 
-    def __init__(self, omp_executable: Path, root_fds: str) -> None:
+    def __init__(self, omp_executable: str, root_fds: str) -> None:
         self._omp_executable = omp_executable
         self._root_fds = root_fds
         self.probed_pids: set[int] = set()
@@ -57,7 +81,9 @@ class OmpLiveSaveTests(unittest.TestCase):
         self._directory = TemporaryDirectory()
         self.addCleanup(self._directory.cleanup)
 
-    def _run_with_live_tab(self, root_fds: str) -> tuple[Path, _FakeSystem]:
+    def _run_with_live_tab(
+        self, root_fds: str, lsof_executable: str | None = None
+    ) -> tuple[Path, _FakeSystem]:
         root = Path(self._directory.name)
         cwd = root / "repo"
         cwd.mkdir()
@@ -77,7 +103,7 @@ class OmpLiveSaveTests(unittest.TestCase):
         executable.parent.mkdir()
         executable.write_text("#!/bin/sh\n", encoding="utf-8")
         executable.chmod(0o755)
-        fake = _FakeSystem(executable, root_fds)
+        fake = _FakeSystem(lsof_executable or str(executable), root_fds)
         for patcher in (
             patch.dict(os.environ, {"OLLEMOLLE_STATE_DIR": str(root / "state")}),
             patch.object(discovery, "_run", side_effect=fake.run),
@@ -128,6 +154,26 @@ class OmpLiveSaveTests(unittest.TestCase):
             str(raised.exception),
         )
         self.assertFalse((root / "state" / "after-update.json").exists())
+
+    def _save_with_upgraded_omp(self) -> Path:
+        prefix = Path(self._directory.name) / "opt" / "homebrew"
+        _install_homebrew(prefix, formula="omp", tool="omp")
+        keg = _keg(prefix, "omp", "omp", "18.8.5")
+        _write_executable(keg)
+        self._run_with_live_tab(
+            "p123\nf0\nn/dev/ttys001\nf1\nn/dev/ttys001\nf2\nn/dev/ttys001\n",
+            lsof_executable=str(keg),
+        )
+        with patch.dict(os.environ, {"PATH": str(prefix / "bin")}):
+            main.save_snapshot("after-upgrade")
+        return read_snapshot("after-upgrade").sessions[0].executable
+
+    def test_save_records_stable_launcher_while_upgraded_keg_still_runs(self) -> None:
+        saved = self._save_with_upgraded_omp()
+
+        self.assertEqual(
+            saved, Path(self._directory.name) / "opt" / "homebrew" / "bin" / "omp"
+        )
 
 
 class ProcessTableTests(unittest.TestCase):
@@ -392,6 +438,241 @@ class OmpDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(sessions, ())
         self.assertEqual(issues, [])
+
+
+class HomebrewLauncherSaveTests(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+
+    def _preferred(self, prefix: Path, actual: Path) -> Path:
+        with patch.dict(os.environ, {"PATH": str(prefix / "bin")}):
+            return discovery._preferred_executable("omp", actual)
+
+    def test_stable_launcher_replaces_removed_keg_for_either_prefix(self) -> None:
+        for prefix_parts in (("opt", "homebrew"), ("usr", "local")):
+            with self.subTest(prefix="/".join(prefix_parts)):
+                prefix = self.root.joinpath(*prefix_parts)
+                launcher = _install_homebrew(prefix, formula="omp", tool="omp")
+
+                self.assertEqual(
+                    self._preferred(prefix, _keg(prefix, "omp", "omp", "18.8.5")),
+                    launcher,
+                )
+
+    def test_unusable_launcher_keeps_the_running_executable(self) -> None:
+        def other_formula(prefix: Path) -> None:
+            _install_homebrew(prefix, formula="omp-beta", tool="omp")
+
+        def outside_tree(prefix: Path) -> None:
+            external = _write_executable(self.root / "elsewhere" / "omp")
+            (prefix / "bin").mkdir(parents=True)
+            (prefix / "bin" / "omp").symlink_to(external)
+
+        def not_runnable(prefix: Path) -> None:
+            _install_homebrew(prefix, formula="omp", tool="omp")
+            _keg(prefix, "omp", "omp", "18.8.6").chmod(0o644)
+
+        def absent(_prefix: Path) -> None:
+            pass
+
+        cases = {
+            "other formula": other_formula,
+            "outside tree": outside_tree,
+            "not runnable": not_runnable,
+            "absent": absent,
+        }
+        for index, (name, install) in enumerate(cases.items()):
+            with self.subTest(name):
+                prefix = self.root / f"case-{index}"
+                install(prefix)
+                keg = _keg(prefix, "omp", "omp", "18.8.5")
+
+                self.assertEqual(self._preferred(prefix, keg), keg)
+
+    def test_custom_executable_is_saved_as_is(self) -> None:
+        prefix = self.root / "opt" / "homebrew"
+        _install_homebrew(prefix, formula="omp", tool="omp")
+        custom = _write_executable(self.root / "custom" / "omp")
+
+        self.assertEqual(self._preferred(prefix, custom), custom)
+
+
+class HomebrewRestoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.cwd = self.root / "repo"
+        self.cwd.mkdir()
+        self.omp_file = self.root / "omp.jsonl"
+        self.omp_file.write_text("", encoding="utf-8")
+        self.claude_file = self.root / "claude.jsonl"
+        self.claude_file.write_text("", encoding="utf-8")
+        self.claude_bin = _write_executable(self.root / "bin" / "claude")
+        for patcher in (
+            patch.object(main, "ensure_ghostty_available"),
+            patch.object(discovery, "discover_sessions", return_value=Discovery()),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _snapshot(
+        self, omp_executable: Path, claude_executable: Path | None = None
+    ) -> Snapshot:
+        return Snapshot(
+            saved_at=datetime(2026, 10, 1, 8, tzinfo=UTC),
+            sessions=(
+                Session(
+                    tool="omp",
+                    cwd=self.cwd,
+                    session_id=_OMP_SESSION_ID,
+                    session_file=self.omp_file,
+                    executable=omp_executable,
+                    label="repo work",
+                    tty="ttys001",
+                    pid=123,
+                    process_started=_PROCESS_STARTED,
+                    resume_args=("--profile", "work", "--resume", str(self.omp_file)),
+                ),
+                Session(
+                    tool="claude",
+                    cwd=self.cwd,
+                    session_id=_CLAUDE_SESSION_ID,
+                    session_file=self.claude_file,
+                    executable=claude_executable or self.claude_bin,
+                    label="repo claude",
+                    tty="ttys002",
+                    pid=456,
+                    process_started=_PROCESS_STARTED,
+                    resume_args=("--resume", _CLAUDE_SESSION_ID),
+                ),
+            ),
+        )
+
+    def _assert_omp_refused(self, executable: Path) -> None:
+        with self.assertRaises(main.RestorePreflightError) as raised:
+            main.preflight_restore(self._snapshot(executable))
+        self.assertIn(
+            f"omp:{_OMP_SESSION_ID}: executable is not a file: {executable}",
+            str(raised.exception),
+        )
+
+    def test_removed_keg_restores_through_stable_launcher_with_same_arguments(
+        self,
+    ) -> None:
+        for prefix_parts in (("opt", "homebrew"), ("usr", "local")):
+            with self.subTest(prefix="/".join(prefix_parts)):
+                prefix = self.root.joinpath(*prefix_parts)
+                omp_launcher = _install_homebrew(prefix, formula="omp", tool="omp")
+                claude_launcher = _install_homebrew(
+                    prefix, formula=_CLAUDE_FORMULA, tool="claude"
+                )
+                omp_keg = _keg(prefix, "omp", "omp", "18.8.5")
+                snapshot = self._snapshot(
+                    omp_keg, _keg(prefix, _CLAUDE_FORMULA, "claude", "1.0.0")
+                )
+                before = snapshot.model_dump()
+
+                requests = main.preflight_restore(snapshot)
+
+                self.assertEqual(
+                    [request.argv for request in requests],
+                    [
+                        (
+                            str(omp_launcher),
+                            "--profile",
+                            "work",
+                            "--resume",
+                            str(self.omp_file),
+                        ),
+                        (str(claude_launcher), "--resume", _CLAUDE_SESSION_ID),
+                    ],
+                )
+                self.assertEqual(
+                    [request.session.session_id for request in requests],
+                    [_OMP_SESSION_ID, _CLAUDE_SESSION_ID],
+                )
+                self.assertEqual(snapshot.model_dump(), before)
+                self.assertEqual(snapshot.sessions[0].executable, omp_keg)
+
+    def test_existing_runnable_executable_is_restored_unchanged(self) -> None:
+        prefix = self.root / "opt" / "homebrew"
+        _install_homebrew(prefix, formula="omp", tool="omp")
+        pinned_keg = _write_executable(_keg(prefix, "omp", "omp", "18.8.5"))
+        custom = _write_executable(self.root / "custom" / "omp")
+        for executable in (pinned_keg, custom):
+            with self.subTest(executable=str(executable)):
+                requests = main.preflight_restore(self._snapshot(executable))
+
+                self.assertEqual(
+                    requests[0].argv,
+                    (
+                        str(executable),
+                        "--profile",
+                        "work",
+                        "--resume",
+                        str(self.omp_file),
+                    ),
+                )
+
+    def test_launcher_for_another_formula_is_not_used(self) -> None:
+        prefix = self.root / "wrong-formula"
+        _install_homebrew(prefix, formula="omp-beta", tool="omp")
+
+        self._assert_omp_refused(_keg(prefix, "omp", "omp", "18.8.5"))
+
+    def test_launcher_outside_formula_tree_is_not_used(self) -> None:
+        prefix = self.root / "outside"
+        external = _write_executable(self.root / "elsewhere" / "omp")
+        (prefix / "bin").mkdir(parents=True)
+        (prefix / "bin" / "omp").symlink_to(external)
+
+        self._assert_omp_refused(_keg(prefix, "omp", "omp", "18.8.5"))
+
+    def test_non_runnable_launcher_is_not_used(self) -> None:
+        prefix = self.root / "not-runnable"
+        _install_homebrew(prefix, formula="omp", tool="omp")
+        _keg(prefix, "omp", "omp", "18.8.6").chmod(0o644)
+
+        self._assert_omp_refused(_keg(prefix, "omp", "omp", "18.8.5"))
+
+    def test_absent_launcher_keeps_restore_failure(self) -> None:
+        prefix = self.root / "absent"
+
+        self._assert_omp_refused(_keg(prefix, "omp", "omp", "18.8.5"))
+
+    def test_arbitrary_missing_executable_is_not_redirected(self) -> None:
+        prefix = self.root / "arbitrary"
+        _install_homebrew(prefix, formula="omp", tool="omp")
+
+        self._assert_omp_refused(self.root / "missing" / "bin" / "omp")
+
+    def test_keg_path_that_is_a_directory_is_not_redirected(self) -> None:
+        prefix = self.root / "directory"
+        _install_homebrew(prefix, formula="omp", tool="omp")
+        keg = _keg(prefix, "omp", "omp", "18.8.5")
+        keg.mkdir(parents=True)
+
+        self._assert_omp_refused(keg)
+
+    def test_dangling_keg_symlink_keeps_restore_failure(self) -> None:
+        prefix = self.root / "dangling"
+        _install_homebrew(prefix, formula="omp", tool="omp")
+        keg = _keg(prefix, "omp", "omp", "18.8.5")
+        keg.parent.mkdir(parents=True)
+        keg.symlink_to(self.root / "gone" / "omp")
+
+        self._assert_omp_refused(keg)
+
+    def test_path_under_regular_file_keeps_restore_failure(self) -> None:
+        blocker = self.root / "blocker"
+        blocker.write_text("", encoding="utf-8")
+
+        self._assert_omp_refused(
+            blocker / "opt" / "homebrew" / "Cellar" / "omp" / "18.8.5" / "bin" / "omp"
+        )
 
 
 if __name__ == "__main__":
